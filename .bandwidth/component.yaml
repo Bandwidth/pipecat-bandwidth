@@ -1,0 +1,17 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  schemaVersion: v1.0.0
+  name: pipecat-bandwidth
+  description: Community serializer to use Bandwidth Telephony with Pipecat
+  annotations:
+    github.com/project-slug: Bandwidth/pipecat-bandwidth
+  organization: BW
+  costCenter: 
+  platformType: 
+  buildPlatform: GitHub Actions
+spec:
+  type: Service
+  owner: github/band-swi
+  lifecycle: Prototype
+  
