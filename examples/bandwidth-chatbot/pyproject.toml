@@ -1,0 +1,16 @@
+[project]
+name = "bandwidth-chatbot"
+version = "0.1.0"
+description = "Foundational Bandwidth + Pipecat voice bot example"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pipecat-bandwidth",
+    "pipecat-ai[cartesia,deepgram,openai,silero,websocket]>=1.0.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "python-dotenv>=1.0",
+]
+
+[tool.uv.sources]
+pipecat-bandwidth = { path = "../..", editable = true }
