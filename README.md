@@ -41,8 +41,12 @@ from pipecat.transports.websocket.fastapi import (
 )
 from pipecat_bandwidth import BandwidthFrameSerializer
 
-# stream_id, call_id, account_id come from Bandwidth's first WebSocket message
-# (the "start" event's metadata block).
+# IMPORTANT: call_id and account_id flow into an authenticated POST to the
+# Bandwidth Voice API on auto hang-up. They MUST come from a server-trusted
+# source — typically the (authenticated) inbound voice webhook body — and
+# NOT from the WebSocket "start" event's metadata, which is unauthenticated
+# and attacker-controllable. See the chatbot example for one safe pattern
+# (token-in-URL correlating the webhook to the WS connect).
 serializer = BandwidthFrameSerializer(
     stream_id=stream_id,
     call_id=call_id,
