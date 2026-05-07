@@ -81,6 +81,42 @@ class TestBandwidthFrameSerializerInit(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             _make_serializer(outbound_encoding="PCM", outbound_pcm_sample_rate=11025)
 
+    def test_call_id_with_url_meta_chars_rejected(self):
+        # `?`, `#`, `/`, `%` would otherwise leak into the auto-hang-up REST
+        # URL as query/fragment/path-traversal vectors. They must be rejected
+        # at construction time.
+        for bad in ("call?force=1", "call#frag", "call/extra", "call%2f"):
+            with self.subTest(call_id=bad):
+                with self.assertRaises(ValueError):
+                    BandwidthFrameSerializer(
+                        stream_id="s",
+                        call_id=bad,
+                        account_id="acc",
+                        client_id="cid",
+                        client_secret="csec",
+                    )
+
+    def test_account_id_with_url_meta_chars_rejected(self):
+        with self.assertRaises(ValueError):
+            BandwidthFrameSerializer(
+                stream_id="s",
+                call_id="call",
+                account_id="acc/../other",
+                client_id="cid",
+                client_secret="csec",
+            )
+
+    def test_realistic_bandwidth_ids_accepted(self):
+        # Bandwidth call IDs look like `c-15ac29a2-1331029f-a45f-4f04-b54a-1c5da8ce1cc0`;
+        # account IDs are numeric. Both fit the unreserved-char alphabet.
+        BandwidthFrameSerializer(
+            stream_id="strm-abc",
+            call_id="c-15ac29a2-1331029f-a45f-4f04-b54a-1c5da8ce1cc0",
+            account_id="9900000",
+            client_id="cid",
+            client_secret="csec",
+        )
+
 
 class TestBandwidthFrameSerializerDeserialize(unittest.IsolatedAsyncioTestCase):
     """Inbound message handling."""

@@ -39,8 +39,13 @@ ngrok http 7860
 Note the `https://...ngrok-free.app` hostname (without the scheme) and put it
 in `.env` as `PROXY_HOST`.
 
-In your Bandwidth Voice Application configuration, set the Voice Webhook URL
-to `https://<your-ngrok-host>/`.
+In your Bandwidth Voice Application configuration:
+
+- Set the Voice Webhook URL to `https://<your-ngrok-host>/`.
+- Set HTTP Basic Auth on the webhook using the same
+  `BANDWIDTH_WEBHOOK_USERNAME` / `BANDWIDTH_WEBHOOK_PASSWORD` you put in
+  `.env`. The bot rejects unauthenticated POSTs (returns `401`) and refuses
+  to start if these env vars are unset (returns `503`).
 
 ## Run
 
@@ -53,19 +58,39 @@ can start a conversation.
 
 ## How it works
 
-1. **Inbound call.** Bandwidth POSTs to `/` when a call comes in. The bot
-   responds with a `<StartStream>` BXML document pointing at the WebSocket
-   endpoint.
-2. **WebSocket handshake.** Bandwidth opens a WebSocket to `/ws` and sends a
-   `start` event whose `metadata` block carries `streamId`, `callId`, and
-   `accountId`. The bot reads this first frame to construct
-   `BandwidthFrameSerializer`.
+1. **Inbound call.** Bandwidth POSTs to `/` (HTTP Basic Auth) when a call
+   comes in. The bot reads `callId` and `accountId` from the authenticated
+   webhook body, mints a one-time correlation token, and responds with a
+   `<StartStream>` BXML pointing at `wss://<host>/ws/<token>`.
+2. **WebSocket handshake.** Bandwidth opens a WebSocket to `/ws/<token>`.
+   The bot validates the token, looks up the trusted call/account IDs from
+   server-side state, and constructs `BandwidthFrameSerializer` with those
+   IDs — **not** with whatever the WebSocket's `start` event metadata
+   claims.
 3. **Pipeline runs.** Inbound μ-law audio is decoded, transcribed, fed to the
    LLM, the response is synthesized to audio, and sent back to Bandwidth as
    `playAudio` events. Interruptions emit a `clear` event so the bot stops
    talking immediately when the caller speaks.
 4. **Hang up.** When the pipeline ends, the serializer terminates the call via
-   the Bandwidth Voice API.
+   the Bandwidth Voice API using the trusted call ID.
+
+## Why the token-in-URL?
+
+The auto-hang-up path inside `BandwidthFrameSerializer` POSTs to the Voice
+API using the operator's OAuth credentials. If the call ID it operates on
+came from an unauthenticated WebSocket frame, anyone who can reach `/ws`
+could feed the bot an arbitrary call ID in the operator's account and
+trigger a hang-up against a live call. Trusting only the (Basic-Auth'd)
+webhook body for `callId`/`accountId` and binding them to the WebSocket via
+a server-issued correlation token closes that hole.
+
+For production deployments, also consider:
+
+- Verifying Bandwidth's webhook signature in addition to (or instead of)
+  Basic Auth.
+- IP-allowlisting Bandwidth's egress ranges at your ingress.
+- Backing the in-memory token store with Redis or similar if you run more
+  than one worker.
 
 ## Notes
 

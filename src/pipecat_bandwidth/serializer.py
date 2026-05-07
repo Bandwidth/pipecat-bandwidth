@@ -8,9 +8,27 @@
 
 import base64
 import json
+import re
 from typing import cast
 
 from loguru import logger
+
+# RFC 3986 "unreserved" characters. account_id and call_id are interpolated
+# into a Voice API URL as path segments; restricting them to this alphabet
+# means a caller can never inject `?`, `#`, `/`, `%`, etc. into the request
+# URL — even if the IDs were sourced from untrusted input.
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._~-]+$")
+
+
+def _validate_id(value: str | None, name: str) -> None:
+    """Reject ID values that contain URL meta-characters."""
+    if value is None:
+        return
+    if not _SAFE_ID_RE.match(value):
+        raise ValueError(
+            f"{name} must contain only unreserved URL characters "
+            f"(letters, digits, '.', '_', '~', '-'); got: {value!r}"
+        )
 from pipecat.audio.utils import create_stream_resampler, pcm_to_ulaw, ulaw_to_pcm
 from pipecat.frames.frames import (
     AudioRawFrame,
@@ -96,14 +114,25 @@ class BandwidthFrameSerializer(FrameSerializer):
         Args:
             stream_id: The Bandwidth Stream ID, available in the ``start``
                 event metadata.
-            call_id: The Bandwidth Call ID (required for auto hang-up).
+            call_id: The Bandwidth Call ID (required for auto hang-up). Must
+                come from a server-trusted source — e.g. the signed inbound
+                voice webhook. Do **not** read this from the unauthenticated
+                WebSocket ``start`` event, since an attacker who reaches the
+                WebSocket can otherwise drive the auto-hang-up call against
+                an arbitrary call ID in your account.
             account_id: The Bandwidth account ID (required for auto hang-up).
+                Same trust requirement as ``call_id``.
             client_id: OAuth 2.0 Client ID for Bandwidth API authentication
                 (required for auto hang-up). Used together with
                 ``client_secret`` to obtain a Bearer token from Bandwidth's
                 identity provider via the client_credentials grant.
             client_secret: OAuth 2.0 Client Secret (required for auto hang-up).
             params: Configuration parameters.
+
+        Raises:
+            ValueError: If ``call_id`` or ``account_id`` contain characters
+                outside the RFC 3986 unreserved set, or if ``auto_hang_up``
+                is enabled but any required credential is missing.
         """
         params = params or BandwidthFrameSerializer.InputParams()
         super().__init__(params)
@@ -124,6 +153,9 @@ class BandwidthFrameSerializer(FrameSerializer):
                     "auto_hang_up is enabled but missing required parameters: "
                     f"{', '.join(missing_credentials)}"
                 )
+
+        _validate_id(call_id, "call_id")
+        _validate_id(account_id, "account_id")
 
         if self._params.outbound_encoding not in ("PCMU", "PCM"):
             raise ValueError(

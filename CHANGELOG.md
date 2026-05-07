@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- `BandwidthFrameSerializer` now validates `call_id` and `account_id` against
+  the RFC 3986 unreserved character set at construction. Previously, IDs
+  containing URL meta-characters (`?`, `#`, `/`, `%`) could leak into the
+  auto-hang-up REST URL as query/fragment/path-traversal vectors on a
+  request authenticated with the operator's OAuth credentials.
+- The `bandwidth-chatbot` example now requires HTTP Basic Auth on the
+  inbound voice webhook and binds the WebSocket to the trusted call via a
+  one-time correlation token in the BXML `StartStream` destination URL,
+  instead of trusting `callId` / `accountId` from the unauthenticated
+  WebSocket `start` event. The previous pattern allowed any peer that
+  reached `/ws` to drive the operator's auto-hang-up against an arbitrary
+  call ID in their account.
+
 ## [0.1.0] - 2026-05-04
 
 ### Added
