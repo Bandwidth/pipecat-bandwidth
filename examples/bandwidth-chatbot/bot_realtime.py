@@ -4,38 +4,47 @@
 # SPDX-License-Identifier: BSD-2-Clause
 #
 
-"""Foundational Bandwidth + Pipecat example.
+"""Speech-to-speech Bandwidth + Pipecat example using OpenAI Realtime.
 
-A single-file FastAPI application that handles a Bandwidth Programmable Voice
-inbound call:
+Same inbound trust chain as ``bot.py``, but the three-service cascade
+(Deepgram STT -> OpenAI LLM -> Cartesia TTS) collapses into a single
+speech-to-speech service:
 
-1. ``POST /`` (Basic Auth) is the Bandwidth voice webhook. We pull the
-   server-trusted ``callId``/``accountId`` straight from the (authenticated)
-   webhook body, mint a one-time correlation token, and return a
-   ``<StartStream>`` BXML pointing at ``wss://<host>/ws/<token>``.
-2. ``/ws/{token}`` validates the token, looks up the trusted call/account
-   IDs from server-side state, and runs a Pipecat pipeline:
+    Bandwidth WS  ->  OpenAI Realtime (STT + LLM + TTS)  ->  Bandwidth WS
 
-       Bandwidth WS  ->  Deepgram STT  ->  OpenAI LLM  ->  Cartesia TTS  ->  Bandwidth WS
+This needs only an OpenAI API key for the AI side — no Deepgram, no
+Cartesia. ``OpenAIRealtimeLLMService`` ingests caller audio and emits the
+reply audio directly, and the OpenAI Realtime API performs server-side turn
+detection, so there is no separate VAD analyzer in the pipeline.
 
-This trust chain matters: without it, anyone who reaches the WebSocket can
-hand us an arbitrary callId in the ``start`` event metadata and the
-serializer's auto-hang-up path will fire the operator's OAuth credentials at
-that callId, terminating live calls.
+Two details specific to the realtime model:
+
+1. It works in 24 kHz PCM both directions. We run the pipeline at 24 kHz and
+   configure the serializer for ``PCM`` output at 24 kHz; the serializer
+   already resamples Bandwidth's 8 kHz μ-law wire audio to the pipeline rate.
+2. ``LLMContextAggregatorPair`` is constructed with ``realtime_service_mode=True``,
+   which pipecat recommends for speech-to-speech services (context writes are
+   driven by the content stream rather than discrete turn frames). There is no
+   VAD analyzer in the pipeline: the service broadcasts the user-speaking
+   frames off OpenAI's server-side speech events.
 
 Run::
 
     uv sync
-    cp env.example .env  # fill in API keys + Bandwidth credentials
-    uv run python bot.py
+    cp env.example .env  # OPENAI_API_KEY + Bandwidth credentials are enough
+    uv run python bot_realtime.py
 
 Then point an ngrok tunnel at port 7860 and configure your Bandwidth
-application's voice webhook to ``https://<your-ngrok-host>/`` with HTTP Basic
-Auth using the same username/password you set in ``.env``.
+application's voice webhook to ``https://<your-ngrok-host>/``.
+
+Unlike ``bot.py``, there is no Basic Auth on ``POST /``. The webhook still
+mints a one-time token and the trusted call/account IDs are carried through
+the token mapping (not the WS ``start`` metadata), but the POST itself is
+unauthenticated — matching ``bot_outbound.py``'s trust model. For a
+production inbound deployment, re-add webhook Basic Auth as ``bot.py`` does.
 """
 
 import asyncio
-import base64
 import json
 import os
 import secrets
@@ -45,23 +54,20 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, WebSocket, status
 from fastapi.responses import HTMLResponse
 from loguru import logger
-from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.pipeline.runner import PipelineRunner
+from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
-    LLMUserAggregatorParams,
 )
-from pipecat.services.cartesia.tts import CartesiaTTSService
-from pipecat.services.deepgram.stt import DeepgramSTTService
-from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.openai.realtime import events
+from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
 )
-from pipecat.workers.runner import WorkerRunner
 
 from pipecat_bandwidth import BandwidthFrameSerializer
 
@@ -69,13 +75,6 @@ load_dotenv(override=True)
 
 PROXY_HOST = os.getenv("PROXY_HOST", "")  # e.g. "abcd-12-34-56-78.ngrok-free.app"
 PORT = int(os.getenv("PORT", "7860"))
-
-# Webhook auth. Configure the same credentials in your Bandwidth voice
-# application's webhook settings. Without this, anyone who reaches POST / can
-# forge a webhook body and obtain a /ws/{token} URL bound to an arbitrary
-# callId.
-WEBHOOK_USERNAME = os.getenv("BANDWIDTH_WEBHOOK_USERNAME", "")
-WEBHOOK_PASSWORD = os.getenv("BANDWIDTH_WEBHOOK_PASSWORD", "")
 
 # How long an issued token is valid before Bandwidth must connect to /ws.
 TOKEN_TTL_SECONDS = 60
@@ -87,41 +86,6 @@ app = FastAPI()
 # only; for multi-worker deployments back this with Redis or similar.
 _pending_calls: dict[str, tuple[str, str, float]] = {}
 _pending_calls_lock = asyncio.Lock()
-
-
-def _verify_webhook_auth(request: Request) -> None:
-    """Reject the request unless Basic Auth matches the configured creds."""
-    if not WEBHOOK_USERNAME or not WEBHOOK_PASSWORD:
-        # Refuse to run without webhook auth — silent acceptance would
-        # reintroduce the very vulnerability this example exists to avoid.
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Webhook authentication is not configured on the server.",
-        )
-
-    auth_header = request.headers.get("authorization", "")
-    if not auth_header.lower().startswith("basic "):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Webhook requires Basic Auth",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-    try:
-        decoded = base64.b64decode(auth_header.split(" ", 1)[1]).decode("utf-8")
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Malformed credentials"
-        ) from exc
-    username, _, password = decoded.partition(":")
-
-    user_ok = secrets.compare_digest(username, WEBHOOK_USERNAME)
-    pass_ok = secrets.compare_digest(password, WEBHOOK_PASSWORD)
-    if not (user_ok and pass_ok):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid webhook credentials",
-            headers={"WWW-Authenticate": "Basic"},
-        )
 
 
 async def _issue_token(call_id: str, account_id: str) -> str:
@@ -151,9 +115,7 @@ async def _consume_token(token: str) -> tuple[str, str] | None:
 
 @app.post("/")
 async def inbound_call(request: Request) -> HTMLResponse:
-    """Bandwidth voice webhook. Basic Auth required; trust the body's IDs."""
-    _verify_webhook_auth(request)
-
+    """Bandwidth voice webhook. Mint a token bound to the body's call IDs."""
     body = await request.json()
     call_id = body.get("callId")
     account_id = body.get("accountId")
@@ -204,6 +166,12 @@ async def websocket_endpoint(websocket: WebSocket, token: str) -> None:
         account_id=account_id,
         client_id=os.getenv("BANDWIDTH_CLIENT_ID"),
         client_secret=os.getenv("BANDWIDTH_CLIENT_SECRET"),
+        params=BandwidthFrameSerializer.InputParams(
+            # OpenAI Realtime emits 24 kHz PCM; send it to Bandwidth as PCM
+            # rather than down-converting to μ-law for better fidelity.
+            outbound_encoding="PCM",
+            outbound_pcm_sample_rate=24000,
+        ),
     )
 
     transport = FastAPIWebsocketTransport(
@@ -220,50 +188,64 @@ async def websocket_endpoint(websocket: WebSocket, token: str) -> None:
 
 
 async def run_bot(transport: FastAPIWebsocketTransport) -> None:
-    """Build and run the Pipecat pipeline for one call."""
-    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
-
-    llm = OpenAILLMService(
+    """Build and run the speech-to-speech pipeline for one call."""
+    llm = OpenAIRealtimeLLMService(
         api_key=os.getenv("OPENAI_API_KEY"),
-        settings=OpenAILLMService.Settings(
+        settings=OpenAIRealtimeLLMService.Settings(
             system_instruction=(
                 "You are a helpful assistant on a phone call. Keep responses "
                 "concise and conversational. Avoid special characters since "
                 "your output is converted to audio."
             ),
+            # Telephony tuning. The default server VAD (threshold 0.5,
+            # silence 500ms) is too sensitive for phone audio: line/acoustic
+            # echo of the bot's own speech gets detected as the caller talking
+            # and self-interrupts the bot. Raise the threshold so low-amplitude
+            # echo is ignored, require a longer silence to end a turn, and use
+            # far-field noise reduction (caller audio is far-field telephony).
+            session_properties=events.SessionProperties(
+                audio=events.AudioConfiguration(
+                    input=events.AudioInput(
+                        noise_reduction=events.InputAudioNoiseReduction(
+                            type="far_field",
+                        ),
+                        turn_detection=events.TurnDetection(
+                            threshold=0.8,
+                            prefix_padding_ms=300,
+                            silence_duration_ms=800,
+                        ),
+                    ),
+                ),
+            ),
         ),
     )
 
-    tts = CartesiaTTSService(
-        api_key=os.getenv("CARTESIA_API_KEY"),
-        settings=CartesiaTTSService.Settings(
-            voice="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
-        ),
-    )
-
+    # realtime_service_mode=True is pipecat's recommended configuration for
+    # speech-to-speech services: context writes are driven by the content
+    # stream rather than discrete turn frames. No VAD analyzer is needed — the
+    # OpenAI Realtime API does server-side turn detection and the service
+    # broadcasts the UserStartedSpeaking / UserStoppedSpeaking frames itself.
     context = LLMContext()
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+        realtime_service_mode=True,
     )
 
     pipeline = Pipeline(
         [
             transport.input(),
-            stt,
             user_aggregator,
             llm,
-            tts,
             transport.output(),
             assistant_aggregator,
         ]
     )
 
-    worker = PipelineWorker(
+    task = PipelineTask(
         pipeline,
         params=PipelineParams(
-            audio_in_sample_rate=8000,
-            audio_out_sample_rate=8000,
+            audio_in_sample_rate=24000,
+            audio_out_sample_rate=24000,
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
@@ -272,15 +254,14 @@ async def run_bot(transport: FastAPIWebsocketTransport) -> None:
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         context.add_message({"role": "user", "content": "Please introduce yourself to the caller."})
-        await worker.queue_frames([LLMRunFrame()])
+        await task.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
-        await worker.cancel()
+        await task.cancel()
 
-    runner = WorkerRunner(handle_sigint=False)
-    await runner.add_workers(worker)
-    await runner.run()
+    runner = PipelineRunner(handle_sigint=False)
+    await runner.run(task)
 
 
 if __name__ == "__main__":
@@ -290,11 +271,6 @@ if __name__ == "__main__":
         logger.warning(
             "PROXY_HOST is not set — the BXML response will reference an empty "
             "host. Set PROXY_HOST in .env to your public ngrok hostname."
-        )
-    if not WEBHOOK_USERNAME or not WEBHOOK_PASSWORD:
-        logger.warning(
-            "BANDWIDTH_WEBHOOK_USERNAME / BANDWIDTH_WEBHOOK_PASSWORD are not "
-            "set; POST / will return 503 until you configure them."
         )
 
     uvicorn.run(app, host="0.0.0.0", port=PORT)
