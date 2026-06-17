@@ -62,6 +62,7 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
 )
+from pipecat.services.openai.realtime import events
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
@@ -195,6 +196,26 @@ async def run_bot(transport: FastAPIWebsocketTransport) -> None:
                 "You are a helpful assistant on a phone call. Keep responses "
                 "concise and conversational. Avoid special characters since "
                 "your output is converted to audio."
+            ),
+            # Telephony tuning. The default server VAD (threshold 0.5,
+            # silence 500ms) is too sensitive for phone audio: line/acoustic
+            # echo of the bot's own speech gets detected as the caller talking
+            # and self-interrupts the bot. Raise the threshold so low-amplitude
+            # echo is ignored, require a longer silence to end a turn, and use
+            # far-field noise reduction (caller audio is far-field telephony).
+            session_properties=events.SessionProperties(
+                audio=events.AudioConfiguration(
+                    input=events.AudioInput(
+                        noise_reduction=events.InputAudioNoiseReduction(
+                            type="far_field",
+                        ),
+                        turn_detection=events.TurnDetection(
+                            threshold=0.8,
+                            prefix_padding_ms=300,
+                            silence_duration_ms=800,
+                        ),
+                    ),
+                ),
             ),
         ),
     )
