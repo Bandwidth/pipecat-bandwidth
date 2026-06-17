@@ -48,8 +48,7 @@ from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
@@ -62,6 +61,7 @@ from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
 )
+from pipecat.workers.runner import WorkerRunner
 
 from pipecat_bandwidth import BandwidthFrameSerializer
 
@@ -259,7 +259,7 @@ async def run_bot(transport: FastAPIWebsocketTransport) -> None:
         ]
     )
 
-    task = PipelineTask(
+    worker = PipelineWorker(
         pipeline,
         params=PipelineParams(
             audio_in_sample_rate=8000,
@@ -272,14 +272,15 @@ async def run_bot(transport: FastAPIWebsocketTransport) -> None:
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         context.add_message({"role": "user", "content": "Please introduce yourself to the caller."})
-        await task.queue_frames([LLMRunFrame()])
+        await worker.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
-        await task.cancel()
+        await worker.cancel()
 
-    runner = PipelineRunner(handle_sigint=False)
-    await runner.run(task)
+    runner = WorkerRunner(handle_sigint=False)
+    await runner.add_workers(worker)
+    await runner.run()
 
 
 if __name__ == "__main__":
