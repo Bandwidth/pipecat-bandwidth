@@ -95,6 +95,11 @@ single-file FastAPI server that:
    for the stream/call/account IDs.
 3. Runs a Deepgram (STT) → OpenAI (LLM) → Cartesia (TTS) Pipecat pipeline.
 
+The example directory also includes `bot_realtime.py`, a speech-to-speech
+variant that runs the call on OpenAI's Realtime model — STT, LLM, and TTS
+collapse into a single service, so it needs **only an OpenAI API key** on the
+AI side (no Deepgram or Cartesia).
+
 See the example's [README](./examples/bandwidth-chatbot/README.md) for setup
 and run instructions.
 
@@ -106,7 +111,7 @@ DTMF handling in your application's webhook handler — not in the serializer.
 
 ## Compatibility
 
-- Tested with Pipecat **v1.1.0**.
+- Tested with Pipecat **v1.4.0**.
 - Python 3.11, 3.12.
 
 ## Links

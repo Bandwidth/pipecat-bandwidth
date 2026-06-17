@@ -92,6 +92,32 @@ For production deployments, also consider:
 - Backing the in-memory token store with Redis or similar if you run more
   than one worker.
 
+## OpenAI Realtime variant (`bot_realtime.py`)
+
+`bot_realtime.py` runs the same inbound flow on OpenAI's Realtime
+speech-to-speech model. STT, LLM, and TTS collapse into one
+`OpenAIRealtimeLLMService`, so on the AI side it needs **only an
+`OPENAI_API_KEY`** — no Deepgram, no Cartesia.
+
+```sh
+uv run python bot_realtime.py
+```
+
+How it differs from `bot.py`:
+
+- **One service, not three.** The pipeline is just
+  `transport.input() → user_agg → llm → transport.output() → assistant_agg`.
+- **24 kHz PCM both directions.** The serializer is configured with
+  `outbound_encoding="PCM"`, `outbound_pcm_sample_rate=24000`, and the
+  pipeline runs at 24 kHz to match the Realtime model.
+- **No VAD analyzer.** OpenAI does server-side turn detection and the service
+  emits the user-speaking frames itself. The VAD is tuned for telephony
+  (`threshold=0.8`, `silence_duration_ms=800`, far-field noise reduction) so
+  line/acoustic echo of the bot's own speech doesn't self-interrupt it.
+- **No webhook Basic Auth.** Unlike `bot.py`, `POST /` is unauthenticated; the
+  one-time WS token still carries server-trusted call IDs. For a production
+  inbound deployment, re-add webhook Basic Auth as `bot.py` does.
+
 ## Notes
 
 - DTMF is captured by Bandwidth's `<Gather>` BXML verb on a separate webhook
