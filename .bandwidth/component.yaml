@@ -6,6 +6,7 @@ metadata:
   description: Community serializer to use Bandwidth Telephony with Pipecat
   annotations:
     github.com/project-slug: Bandwidth/pipecat-bandwidth
+    bandwidth.com/languages: Python
   organization: BW
   costCenter: 
   platformType: 
